@@ -1,7 +1,8 @@
 from rest_framework import serializers
 from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
-from .models import User, Team
+from django.utils import timezone
+from .models import User, Team, Alert, AlertRecipient, AlertStatus
 
 
 class TeamSerializer(serializers.ModelSerializer):
@@ -169,3 +170,200 @@ class ChangePasswordSerializer(serializers.Serializer):
         if not user.check_password(value):
             raise serializers.ValidationError("Old password is incorrect.")
         return value
+
+
+class AlertRecipientSerializer(serializers.ModelSerializer):
+    """
+    Serializer for AlertRecipient model
+    """
+    team_name = serializers.CharField(source='team.name', read_only=True)
+    user_email = serializers.CharField(source='user.email', read_only=True)
+    user_full_name = serializers.CharField(
+        source='user.full_name', read_only=True)
+
+    class Meta:
+        model = AlertRecipient
+        fields = ['id', 'team', 'team_name', 'user',
+                  'user_email', 'user_full_name', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+
+class AlertStatusSerializer(serializers.ModelSerializer):
+    """
+    Serializer for AlertStatus model
+    """
+    user_email = serializers.CharField(source='user.email', read_only=True)
+    user_full_name = serializers.CharField(
+        source='user.full_name', read_only=True)
+    is_snoozed_active = serializers.ReadOnlyField()
+
+    class Meta:
+        model = AlertStatus
+        fields = [
+            'id', 'user', 'user_email', 'user_full_name', 'is_read',
+            'is_snoozed', 'snoozed_until', 'is_snoozed_active',
+            'last_reminded_at', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'user',
+                            'last_reminded_at', 'created_at', 'updated_at']
+
+
+class AlertSerializer(serializers.ModelSerializer):
+    """
+    Serializer for Alert model - used for creation and listing
+    """
+    created_by_name = serializers.CharField(
+        source='created_by.full_name', read_only=True)
+    recipients = AlertRecipientSerializer(
+        source='alert_recipients', many=True, read_only=True)
+    recipient_teams = serializers.ListField(
+        child=serializers.IntegerField(), write_only=True, required=False)
+    recipient_users = serializers.ListField(
+        child=serializers.IntegerField(), write_only=True, required=False)
+    is_expired = serializers.ReadOnlyField()
+
+    class Meta:
+        model = Alert
+        fields = [
+            'id', 'title', 'message_body', 'severity', 'delivery_type',
+            'reminder_frequency', 'visibility_type', 'is_active', 'expires_at',
+            'created_by', 'created_by_name', 'recipients', 'recipient_teams',
+            'recipient_users', 'is_expired', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'created_by', 'created_at', 'updated_at']
+
+    def validate(self, attrs):
+        """
+        Validate alert data
+        """
+        visibility_type = attrs.get('visibility_type')
+        recipient_teams = attrs.get('recipient_teams', [])
+        recipient_users = attrs.get('recipient_users', [])
+
+        if visibility_type == 'teams' and not recipient_teams:
+            raise serializers.ValidationError(
+                "recipient_teams is required when visibility_type is 'teams'")
+
+        if visibility_type == 'users' and not recipient_users:
+            raise serializers.ValidationError(
+                "recipient_users is required when visibility_type is 'users'")
+
+        if visibility_type == 'organization' and (recipient_teams or recipient_users):
+            raise serializers.ValidationError(
+                "recipient_teams and recipient_users should not be provided when visibility_type is 'organization'")
+
+        # Validate expiration date
+        expires_at = attrs.get('expires_at')
+        if expires_at and expires_at <= timezone.now():
+            raise serializers.ValidationError(
+                "expires_at must be in the future")
+
+        return attrs
+
+    def create(self, validated_data):
+        """
+        Create alert with recipients
+        """
+        recipient_teams = validated_data.pop('recipient_teams', [])
+        recipient_users = validated_data.pop('recipient_users', [])
+
+        alert = Alert.objects.create(**validated_data)
+
+        # Create recipients based on visibility type
+        if alert.visibility_type == 'teams':
+            for team_id in recipient_teams:
+                try:
+                    team = Team.objects.get(id=team_id)
+                    AlertRecipient.objects.create(alert=alert, team=team)
+                except Team.DoesNotExist:
+                    pass
+
+        elif alert.visibility_type == 'users':
+            for user_id in recipient_users:
+                try:
+                    user = User.objects.get(id=user_id)
+                    AlertRecipient.objects.create(alert=alert, user=user)
+                except User.DoesNotExist:
+                    pass
+
+        # Create AlertStatus entries for all target users
+        target_users = alert.get_target_users()
+        alert_statuses = [
+            AlertStatus(alert=alert, user=user) for user in target_users
+        ]
+        AlertStatus.objects.bulk_create(alert_statuses, ignore_conflicts=True)
+
+        return alert
+
+
+class AlertDetailSerializer(AlertSerializer):
+    """
+    Detailed serializer for Alert model - includes status information
+    """
+    alert_statuses = AlertStatusSerializer(many=True, read_only=True)
+    total_recipients = serializers.SerializerMethodField()
+    read_count = serializers.SerializerMethodField()
+    unread_count = serializers.SerializerMethodField()
+
+    class Meta(AlertSerializer.Meta):
+        fields = AlertSerializer.Meta.fields + [
+            'alert_statuses', 'total_recipients', 'read_count', 'unread_count'
+        ]
+
+    def get_total_recipients(self, obj):
+        return obj.alert_statuses.count()
+
+    def get_read_count(self, obj):
+        return obj.alert_statuses.filter(is_read=True).count()
+
+    def get_unread_count(self, obj):
+        return obj.alert_statuses.filter(is_read=False).count()
+
+
+class UserAlertSerializer(serializers.ModelSerializer):
+    """
+    Serializer for alerts from user's perspective
+    """
+    alert_status = serializers.SerializerMethodField()
+    created_by_name = serializers.CharField(
+        source='created_by.full_name', read_only=True)
+    is_expired = serializers.ReadOnlyField()
+
+    class Meta:
+        model = Alert
+        fields = [
+            'id', 'title', 'message_body', 'severity', 'delivery_type',
+            'reminder_frequency', 'created_by_name', 'is_expired',
+            'created_at', 'alert_status'
+        ]
+
+    def get_alert_status(self, obj):
+        """
+        Get the alert status for the current user
+        """
+        request = self.context.get('request')
+        if request and request.user.is_authenticated:
+            try:
+                status = obj.alert_statuses.get(user=request.user)
+                return {
+                    'is_read': status.is_read,
+                    'is_snoozed': status.is_snoozed,
+                    'snoozed_until': status.snoozed_until,
+                    'is_snoozed_active': status.is_snoozed_active,
+                }
+            except AlertStatus.DoesNotExist:
+                return {
+                    'is_read': False,
+                    'is_snoozed': False,
+                    'snoozed_until': None,
+                    'is_snoozed_active': False,
+                }
+        return None
+
+
+class SnoozeAlertSerializer(serializers.Serializer):
+    """
+    Serializer for snoozing alerts
+    """
+    hours = serializers.IntegerField(
+        min_value=1, max_value=168, default=2)  # 1 hour to 1 week

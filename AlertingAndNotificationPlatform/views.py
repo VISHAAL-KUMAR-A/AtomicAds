@@ -6,10 +6,15 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken
 from django.contrib.auth import authenticate, logout
-from .models import User, Team
+from django.utils import timezone
+from datetime import timedelta
+from django.db.models import Q, Count
+from .models import User, Team, Alert, AlertRecipient, AlertStatus
 from .serializers import (
     UserRegistrationSerializer, UserLoginSerializer,
-    UserProfileSerializer, ChangePasswordSerializer, TeamSerializer
+    UserProfileSerializer, ChangePasswordSerializer, TeamSerializer,
+    AlertSerializer, AlertDetailSerializer, UserAlertSerializer,
+    AlertStatusSerializer, SnoozeAlertSerializer
 )
 
 
@@ -199,3 +204,370 @@ class CustomTokenRefreshView(TokenRefreshView):
     Custom JWT token refresh view
     """
     pass
+
+
+# Alert Management Views
+
+class AlertListCreateView(generics.ListCreateAPIView):
+    """
+    API endpoint for listing and creating alerts (Admin only for creation)
+    """
+    queryset = Alert.objects.filter(is_active=True)
+    serializer_class = AlertSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        """
+        Filter alerts based on user role
+        """
+        user = self.request.user
+        if user.is_admin:
+            # Admins can see all alerts
+            return Alert.objects.filter(is_active=True).order_by('-created_at')
+        else:
+            # Regular users can only see alerts they created
+            return Alert.objects.filter(
+                created_by=user, is_active=True
+            ).order_by('-created_at')
+
+    def perform_create(self, serializer):
+        """
+        Set the creator of the alert and validate permissions
+        """
+        if not self.request.user.is_admin:
+            raise permissions.PermissionDenied(
+                "Only administrators can create alerts"
+            )
+        serializer.save(created_by=self.request.user)
+
+
+class AlertDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """
+    API endpoint for retrieving, updating, and deleting specific alerts
+    """
+    queryset = Alert.objects.filter(is_active=True)
+    serializer_class = AlertDetailSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        """
+        Filter alerts based on user role
+        """
+        user = self.request.user
+        if user.is_admin:
+            return Alert.objects.filter(is_active=True)
+        else:
+            return Alert.objects.filter(created_by=user, is_active=True)
+
+    def perform_update(self, serializer):
+        """
+        Only allow admins or creators to update alerts
+        """
+        alert = self.get_object()
+        if not (self.request.user.is_admin or alert.created_by == self.request.user):
+            raise permissions.PermissionDenied(
+                "You don't have permission to update this alert"
+            )
+        serializer.save()
+
+    def perform_destroy(self, serializer):
+        """
+        Soft delete - set is_active to False
+        """
+        alert = self.get_object()
+        if not (self.request.user.is_admin or alert.created_by == self.request.user):
+            raise permissions.PermissionDenied(
+                "You don't have permission to delete this alert"
+            )
+        alert.is_active = False
+        alert.save()
+
+
+class UserAlertListView(generics.ListAPIView):
+    """
+    API endpoint for users to see their alerts
+    """
+    serializer_class = UserAlertSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        """
+        Get alerts for the current user based on visibility settings
+        """
+        user = self.request.user
+
+        # Get alerts based on visibility
+        organization_alerts = Q(visibility_type='organization')
+        team_alerts = Q(
+            visibility_type='teams',
+            alert_recipients__team=user.team
+        ) if user.team else Q(pk=None)
+        user_alerts = Q(
+            visibility_type='users',
+            alert_recipients__user=user
+        )
+
+        alerts = Alert.objects.filter(
+            Q(organization_alerts | team_alerts | user_alerts),
+            is_active=True
+        ).distinct().order_by('-created_at')
+
+        # Filter by read status if requested
+        read_filter = self.request.query_params.get('read')
+        if read_filter is not None:
+            is_read = read_filter.lower() == 'true'
+            alert_ids = AlertStatus.objects.filter(
+                user=user, is_read=is_read
+            ).values_list('alert_id', flat=True)
+            alerts = alerts.filter(id__in=alert_ids)
+
+        # Filter by severity if requested
+        severity = self.request.query_params.get('severity')
+        if severity:
+            alerts = alerts.filter(severity=severity)
+
+        return alerts
+
+    def list(self, request, *args, **kwargs):
+        """
+        Override list to include summary statistics
+        """
+        queryset = self.get_queryset()
+        page = self.paginate_queryset(queryset)
+
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = self.get_serializer(queryset, many=True)
+
+        # Add summary statistics
+        user_alert_statuses = AlertStatus.objects.filter(user=request.user)
+        summary = {
+            'total_alerts': queryset.count(),
+            'unread_alerts': user_alert_statuses.filter(is_read=False).count(),
+            'snoozed_alerts': user_alert_statuses.filter(
+                is_snoozed=True,
+                snoozed_until__gt=timezone.now()
+            ).count(),
+        }
+
+        return Response({
+            'summary': summary,
+            'alerts': serializer.data
+        })
+
+
+class MarkAlertAsReadView(APIView):
+    """
+    API endpoint for users to mark alerts as read
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, alert_id):
+        """
+        Mark an alert as read for the current user
+        """
+        try:
+            alert = Alert.objects.get(id=alert_id, is_active=True)
+
+            # Check if user should have access to this alert
+            user = request.user
+            target_users = alert.get_target_users()
+            if user not in target_users:
+                return Response(
+                    {'error': 'You do not have access to this alert'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+            # Get or create alert status
+            alert_status, created = AlertStatus.objects.get_or_create(
+                alert=alert,
+                user=user,
+                defaults={'is_read': True}
+            )
+
+            if not created and not alert_status.is_read:
+                alert_status.is_read = True
+                alert_status.save()
+
+            return Response({
+                'message': 'Alert marked as read',
+                'alert_id': alert_id,
+                'is_read': True
+            }, status=status.HTTP_200_OK)
+
+        except Alert.DoesNotExist:
+            return Response(
+                {'error': 'Alert not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+
+class SnoozeAlertView(APIView):
+    """
+    API endpoint for users to snooze alerts
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, alert_id):
+        """
+        Snooze an alert for the current user
+        """
+        try:
+            alert = Alert.objects.get(id=alert_id, is_active=True)
+
+            # Check if user should have access to this alert
+            user = request.user
+            target_users = alert.get_target_users()
+            if user not in target_users:
+                return Response(
+                    {'error': 'You do not have access to this alert'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+            serializer = SnoozeAlertSerializer(data=request.data)
+            if serializer.is_valid():
+                hours = serializer.validated_data['hours']
+                snooze_until = timezone.now() + timedelta(hours=hours)
+
+                # Get or create alert status
+                alert_status, created = AlertStatus.objects.get_or_create(
+                    alert=alert,
+                    user=user,
+                    defaults={
+                        'is_snoozed': True,
+                        'snoozed_until': snooze_until
+                    }
+                )
+
+                if not created:
+                    alert_status.is_snoozed = True
+                    alert_status.snoozed_until = snooze_until
+                    alert_status.save()
+
+                return Response({
+                    'message': f'Alert snoozed for {hours} hours',
+                    'alert_id': alert_id,
+                    'snoozed_until': snooze_until
+                }, status=status.HTTP_200_OK)
+            else:
+                return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        except Alert.DoesNotExist:
+            return Response(
+                {'error': 'Alert not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+
+class UnsnoozeAlertView(APIView):
+    """
+    API endpoint for users to unsnooze alerts
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, alert_id):
+        """
+        Unsnooze an alert for the current user
+        """
+        try:
+            alert = Alert.objects.get(id=alert_id, is_active=True)
+
+            # Check if user should have access to this alert
+            user = request.user
+            target_users = alert.get_target_users()
+            if user not in target_users:
+                return Response(
+                    {'error': 'You do not have access to this alert'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+            # Update alert status
+            try:
+                alert_status = AlertStatus.objects.get(alert=alert, user=user)
+                alert_status.is_snoozed = False
+                alert_status.snoozed_until = None
+                alert_status.save()
+
+                return Response({
+                    'message': 'Alert unsnoozed successfully',
+                    'alert_id': alert_id
+                }, status=status.HTTP_200_OK)
+
+            except AlertStatus.DoesNotExist:
+                return Response(
+                    {'message': 'Alert was not snoozed'},
+                    status=status.HTTP_200_OK
+                )
+
+        except Alert.DoesNotExist:
+            return Response(
+                {'error': 'Alert not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def alert_stats(request):
+    """
+    API endpoint for alert statistics (Admin only)
+    """
+    if not request.user.is_admin:
+        return Response(
+            {'error': 'Only administrators can access alert statistics'},
+            status=status.HTTP_403_FORBIDDEN
+        )
+
+    # Get basic alert statistics
+    total_alerts = Alert.objects.filter(is_active=True).count()
+    active_alerts = Alert.objects.filter(
+        is_active=True,
+        expires_at__isnull=True
+    ).count() + Alert.objects.filter(
+        is_active=True,
+        expires_at__gt=timezone.now()
+    ).count()
+
+    expired_alerts = Alert.objects.filter(
+        is_active=True,
+        expires_at__lte=timezone.now()
+    ).count()
+
+    # Alerts by severity
+    severity_stats = Alert.objects.filter(is_active=True).values(
+        'severity'
+    ).annotate(count=Count('id'))
+
+    # Recent alerts (last 7 days)
+    week_ago = timezone.now() - timedelta(days=7)
+    recent_alerts = Alert.objects.filter(
+        is_active=True,
+        created_at__gte=week_ago
+    ).count()
+
+    # Alert interaction statistics
+    total_alert_statuses = AlertStatus.objects.count()
+    read_statuses = AlertStatus.objects.filter(is_read=True).count()
+    snoozed_statuses = AlertStatus.objects.filter(
+        is_snoozed=True,
+        snoozed_until__gt=timezone.now()
+    ).count()
+
+    return Response({
+        'alert_stats': {
+            'total_alerts': total_alerts,
+            'active_alerts': active_alerts,
+            'expired_alerts': expired_alerts,
+            'recent_alerts': recent_alerts,
+        },
+        'severity_breakdown': {item['severity']: item['count'] for item in severity_stats},
+        'interaction_stats': {
+            'total_recipients': total_alert_statuses,
+            'read_count': read_statuses,
+            'unread_count': total_alert_statuses - read_statuses,
+            'snoozed_count': snoozed_statuses,
+            'read_percentage': round((read_statuses / total_alert_statuses * 100), 2) if total_alert_statuses > 0 else 0
+        }
+    })

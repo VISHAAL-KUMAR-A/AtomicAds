@@ -20,4 +20,18 @@ urlpatterns = [
 
     # Teams endpoint
     path('teams/', views.TeamListView.as_view(), name='teams'),
+
+    # Alert endpoints
+    path('alerts/', views.AlertListCreateView.as_view(), name='alerts'),
+    path('alerts/<int:pk>/', views.AlertDetailView.as_view(), name='alert_detail'),
+    path('alerts/stats/', views.alert_stats, name='alert_stats'),
+
+    # User alert endpoints
+    path('my-alerts/', views.UserAlertListView.as_view(), name='user_alerts'),
+    path('alerts/<int:alert_id>/read/',
+         views.MarkAlertAsReadView.as_view(), name='mark_alert_read'),
+    path('alerts/<int:alert_id>/snooze/',
+         views.SnoozeAlertView.as_view(), name='snooze_alert'),
+    path('alerts/<int:alert_id>/unsnooze/',
+         views.UnsnoozeAlertView.as_view(), name='unsnooze_alert'),
 ]
