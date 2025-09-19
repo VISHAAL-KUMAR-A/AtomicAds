@@ -25,6 +25,12 @@ urlpatterns = [
     path('alerts/', views.AlertListCreateView.as_view(), name='alerts'),
     path('alerts/<int:pk>/', views.AlertDetailView.as_view(), name='alert_detail'),
     path('alerts/stats/', views.alert_stats, name='alert_stats'),
+    path('alerts/<int:alert_id>/archive/',
+         views.ArchiveAlertView.as_view(), name='archive_alert'),
+    path('alerts/<int:alert_id>/tracking/',
+         views.AlertTrackingView.as_view(), name='alert_tracking'),
+    path('alerts/<int:alert_id>/toggle-reminder/',
+         views.ToggleAlertReminderView.as_view(), name='toggle_alert_reminder'),
 
     # User alert endpoints
     path('my-alerts/', views.UserAlertListView.as_view(), name='user_alerts'),

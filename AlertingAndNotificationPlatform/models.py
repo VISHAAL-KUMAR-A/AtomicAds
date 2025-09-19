@@ -98,7 +98,10 @@ class Alert(models.Model):
     created_by = models.ForeignKey(
         User, on_delete=models.CASCADE, related_name='created_alerts')
     is_active = models.BooleanField(default=True)
+    is_archived = models.BooleanField(default=False)
+    starts_at = models.DateTimeField(null=True, blank=True)
     expires_at = models.DateTimeField(null=True, blank=True)
+    reminder_enabled = models.BooleanField(default=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -111,6 +114,31 @@ class Alert(models.Model):
         if self.expires_at:
             return timezone.now() > self.expires_at
         return False
+
+    @property
+    def is_started(self):
+        if self.starts_at:
+            return timezone.now() >= self.starts_at
+        return True  # If no start time is set, consider it started
+
+    @property
+    def is_currently_active(self):
+        """Check if alert is currently active (started and not expired)"""
+        return self.is_active and self.is_started and not self.is_expired and not self.is_archived
+
+    @property
+    def status(self):
+        """Get the current status of the alert"""
+        if self.is_archived:
+            return 'archived'
+        elif not self.is_active:
+            return 'inactive'
+        elif not self.is_started:
+            return 'scheduled'
+        elif self.is_expired:
+            return 'expired'
+        else:
+            return 'active'
 
     def get_target_users(self):
         """
@@ -200,7 +228,8 @@ class AlertStatus(models.Model):
 
     def should_remind(self):
         """Check if user should receive a reminder for this alert"""
-        if self.is_read or self.is_snoozed_active or self.alert.is_expired:
+        if (self.is_read or self.is_snoozed_active or self.alert.is_expired or
+                not self.alert.reminder_enabled or not self.alert.is_currently_active):
             return False
 
         if not self.last_reminded_at:

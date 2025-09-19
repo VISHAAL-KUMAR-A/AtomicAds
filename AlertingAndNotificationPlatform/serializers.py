@@ -221,14 +221,18 @@ class AlertSerializer(serializers.ModelSerializer):
     recipient_users = serializers.ListField(
         child=serializers.IntegerField(), write_only=True, required=False)
     is_expired = serializers.ReadOnlyField()
+    is_started = serializers.ReadOnlyField()
+    is_currently_active = serializers.ReadOnlyField()
+    status = serializers.ReadOnlyField()
 
     class Meta:
         model = Alert
         fields = [
             'id', 'title', 'message_body', 'severity', 'delivery_type',
-            'reminder_frequency', 'visibility_type', 'is_active', 'expires_at',
-            'created_by', 'created_by_name', 'recipients', 'recipient_teams',
-            'recipient_users', 'is_expired', 'created_at', 'updated_at'
+            'reminder_frequency', 'visibility_type', 'is_active', 'is_archived',
+            'starts_at', 'expires_at', 'reminder_enabled', 'created_by', 'created_by_name',
+            'recipients', 'recipient_teams', 'recipient_users', 'is_expired',
+            'is_started', 'is_currently_active', 'status', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_by', 'created_at', 'updated_at']
 
@@ -252,11 +256,21 @@ class AlertSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 "recipient_teams and recipient_users should not be provided when visibility_type is 'organization'")
 
-        # Validate expiration date
+        # Validate start and expiration dates
+        starts_at = attrs.get('starts_at')
         expires_at = attrs.get('expires_at')
+
+        if starts_at and starts_at <= timezone.now():
+            raise serializers.ValidationError(
+                "starts_at must be in the future")
+
         if expires_at and expires_at <= timezone.now():
             raise serializers.ValidationError(
                 "expires_at must be in the future")
+
+        if starts_at and expires_at and starts_at >= expires_at:
+            raise serializers.ValidationError(
+                "starts_at must be before expires_at")
 
         return attrs
 
@@ -328,12 +342,16 @@ class UserAlertSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(
         source='created_by.full_name', read_only=True)
     is_expired = serializers.ReadOnlyField()
+    is_started = serializers.ReadOnlyField()
+    is_currently_active = serializers.ReadOnlyField()
+    status = serializers.ReadOnlyField()
 
     class Meta:
         model = Alert
         fields = [
             'id', 'title', 'message_body', 'severity', 'delivery_type',
-            'reminder_frequency', 'created_by_name', 'is_expired',
+            'reminder_frequency', 'reminder_enabled', 'created_by_name', 'is_expired',
+            'is_started', 'is_currently_active', 'status', 'starts_at', 'expires_at',
             'created_at', 'alert_status'
         ]
 
@@ -367,3 +385,38 @@ class SnoozeAlertSerializer(serializers.Serializer):
     """
     hours = serializers.IntegerField(
         min_value=1, max_value=168, default=2)  # 1 hour to 1 week
+
+
+class ArchiveAlertSerializer(serializers.Serializer):
+    """
+    Serializer for archiving/unarchiving alerts
+    """
+    is_archived = serializers.BooleanField()
+
+
+class AlertFilterSerializer(serializers.Serializer):
+    """
+    Serializer for filtering alerts in admin views
+    """
+    STATUS_CHOICES = [
+        ('active', 'Active'),
+        ('expired', 'Expired'),
+        ('scheduled', 'Scheduled'),
+        ('archived', 'Archived'),
+        ('inactive', 'Inactive'),
+    ]
+
+    AUDIENCE_CHOICES = [
+        ('organization', 'Entire Organization'),
+        ('teams', 'Specific Teams'),
+        ('users', 'Specific Users'),
+    ]
+
+    status = serializers.ChoiceField(choices=STATUS_CHOICES, required=False)
+    severity = serializers.ChoiceField(
+        choices=Alert.SEVERITY_CHOICES, required=False)
+    audience = serializers.ChoiceField(
+        choices=AUDIENCE_CHOICES, required=False)
+    created_by = serializers.IntegerField(required=False)
+    start_date = serializers.DateTimeField(required=False)
+    end_date = serializers.DateTimeField(required=False)
