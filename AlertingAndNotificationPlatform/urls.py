@@ -18,8 +18,11 @@ urlpatterns = [
          name='change_password'),
     path('dashboard/', views.user_dashboard, name='dashboard'),
 
-    # Teams endpoint
-    path('teams/', views.TeamListView.as_view(), name='teams'),
+    # Team management endpoints
+    path('teams/', views.TeamListCreateView.as_view(), name='teams'),
+    path('teams/<int:pk>/', views.TeamDetailView.as_view(), name='team_detail'),
+    path('teams/<int:team_id>/members/',
+         views.TeamMemberManagementView.as_view(), name='team_members'),
 
     # Alert endpoints
     path('alerts/', views.AlertListCreateView.as_view(), name='alerts'),
@@ -40,4 +43,19 @@ urlpatterns = [
          views.SnoozeAlertView.as_view(), name='snooze_alert'),
     path('alerts/<int:alert_id>/unsnooze/',
          views.UnsnoozeAlertView.as_view(), name='unsnooze_alert'),
+
+    # Notification delivery endpoints
+    path('alerts/<int:alert_id>/send-notification/',
+         views.SendNotificationView.as_view(), name='send_notification'),
+    path('alerts/<int:alert_id>/delivery-status/',
+         views.NotificationDeliveryStatusView.as_view(), name='delivery_status'),
+    path('alerts/<int:alert_id>/retry-notifications/',
+         views.RetryFailedNotificationsView.as_view(), name='retry_notifications'),
+
+    # Scheduler management endpoints
+    path('scheduler/status/', views.SchedulerStatusView.as_view(),
+         name='scheduler_status'),
+    path('scheduler/control/', views.SchedulerControlView.as_view(),
+         name='scheduler_control'),
+    path('scheduler/run-task/', views.RunTaskView.as_view(), name='run_task'),
 ]

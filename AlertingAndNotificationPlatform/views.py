@@ -9,10 +9,11 @@ from django.contrib.auth import authenticate, logout
 from django.utils import timezone
 from datetime import timedelta
 from django.db.models import Q, Count
-from .models import User, Team, Alert, AlertRecipient, AlertStatus
+from .models import User, Team, Alert, AlertRecipient, AlertStatus, NotificationDelivery
 from .serializers import (
     UserRegistrationSerializer, UserLoginSerializer,
     UserProfileSerializer, ChangePasswordSerializer, TeamSerializer,
+    TeamDetailSerializer, TeamMemberAssignmentSerializer,
     AlertSerializer, AlertDetailSerializer, UserAlertSerializer,
     AlertStatusSerializer, SnoozeAlertSerializer, ArchiveAlertSerializer,
     AlertFilterSerializer
@@ -141,13 +142,138 @@ class ChangePasswordView(APIView):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
-class TeamListView(generics.ListAPIView):
+class TeamListCreateView(generics.ListCreateAPIView):
     """
-    API endpoint for listing all teams
+    API endpoint for listing and creating teams (Admin only for creation)
     """
-    queryset = Team.objects.all()
+    queryset = Team.objects.all().order_by('name')
     serializer_class = TeamSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def perform_create(self, serializer):
+        """
+        Only allow admins to create teams
+        """
+        if not self.request.user.is_admin:
+            raise permissions.PermissionDenied(
+                "Only administrators can create teams"
+            )
+        serializer.save()
+
+
+class TeamDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """
+    API endpoint for retrieving, updating, and deleting specific teams
+    """
+    queryset = Team.objects.all()
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_serializer_class(self):
+        """
+        Return detailed serializer for GET requests, basic for others
+        """
+        if self.request.method == 'GET':
+            return TeamDetailSerializer
+        return TeamSerializer
+
+    def perform_update(self, serializer):
+        """
+        Only allow admins to update teams
+        """
+        if not self.request.user.is_admin:
+            raise permissions.PermissionDenied(
+                "Only administrators can update teams"
+            )
+        serializer.save()
+
+    def perform_destroy(self, serializer):
+        """
+        Only allow admins to delete teams
+        Handle team deletion gracefully by reassigning users
+        """
+        if not self.request.user.is_admin:
+            raise permissions.PermissionDenied(
+                "Only administrators can delete teams"
+            )
+
+        team = self.get_object()
+        # Reassign team members to no team before deletion
+        team.members.update(team=None)
+        team.delete()
+
+
+class TeamMemberManagementView(APIView):
+    """
+    API endpoint for managing team members (Admin only)
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, team_id):
+        """
+        Assign or remove users from a team
+        """
+        if not request.user.is_admin:
+            return Response(
+                {'error': 'Only administrators can manage team members'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        try:
+            team = Team.objects.get(id=team_id)
+        except Team.DoesNotExist:
+            return Response(
+                {'error': 'Team not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        serializer = TeamMemberAssignmentSerializer(data=request.data)
+        if serializer.is_valid():
+            user_ids = serializer.validated_data['user_ids']
+            action = serializer.validated_data['action']
+
+            # Validate that all user IDs exist
+            users = User.objects.filter(id__in=user_ids, is_active=True)
+            if len(users) != len(user_ids):
+                invalid_ids = set(user_ids) - \
+                    set(users.values_list('id', flat=True))
+                return Response(
+                    {'error': f'Invalid user IDs: {list(invalid_ids)}'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            if action == 'assign':
+                # Assign users to the team
+                users.update(team=team)
+                message = f'Successfully assigned {len(users)} users to team {team.name}'
+            else:  # remove
+                # Remove users from the team (set team to None)
+                team_users = users.filter(team=team)
+                team_users.update(team=None)
+                message = f'Successfully removed {len(team_users)} users from team {team.name}'
+
+            return Response({
+                'message': message,
+                'team_id': team_id,
+                'team_name': team.name,
+                'action': action,
+                'affected_users': len(users if action == 'assign' else team_users)
+            }, status=status.HTTP_200_OK)
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def get(self, request, team_id):
+        """
+        Get detailed information about team members
+        """
+        try:
+            team = Team.objects.get(id=team_id)
+            serializer = TeamDetailSerializer(team)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        except Team.DoesNotExist:
+            return Response(
+                {'error': 'Team not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
 
 
 @api_view(['GET'])
@@ -816,3 +942,401 @@ def alert_stats(request):
             'read_percentage': round((read_statuses / total_alert_statuses * 100), 2) if total_alert_statuses > 0 else 0
         }
     })
+
+
+# Notification Delivery Views
+
+class SendNotificationView(APIView):
+    """
+    API endpoint for sending notifications manually (Admin only)
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, alert_id):
+        """
+        Send notifications for a specific alert
+        """
+        if not request.user.is_admin:
+            return Response(
+                {'error': 'Only administrators can send notifications'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        try:
+            alert = Alert.objects.get(id=alert_id, is_active=True)
+        except Alert.DoesNotExist:
+            return Response(
+                {'error': 'Alert not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Import notification service
+        from .notification_system import notification_service
+
+        # Get target users for this alert
+        target_users = alert.get_target_users()
+
+        if not target_users.exists():
+            return Response(
+                {'error': 'No target users found for this alert'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        results = []
+        for user in target_users:
+            # Determine recipient based on delivery type
+            if alert.delivery_type == 'email':
+                recipient = user.email
+            elif alert.delivery_type == 'sms':
+                recipient = user.phone_number
+                if not recipient:
+                    results.append({
+                        'user_id': user.id,
+                        'user_email': user.email,
+                        'status': 'failed',
+                        'error': 'No phone number available'
+                    })
+                    continue
+            else:  # in_app
+                recipient = str(user.id)
+
+            # Prepare metadata
+            metadata = {
+                'alert_id': alert.id,
+                'severity': alert.severity,
+                'visibility_type': alert.visibility_type,
+                'sender': request.user.email
+            }
+
+            # Send notification
+            result = notification_service.send_notification(
+                delivery_type=alert.delivery_type,
+                recipient=recipient,
+                title=alert.title,
+                message=alert.message_body,
+                metadata=metadata
+            )
+
+            # Create delivery log
+            delivery_log = NotificationDelivery.objects.create(
+                alert=alert,
+                user=user,
+                delivery_type=alert.delivery_type,
+                recipient=recipient,
+                status=result['status'],
+                message_id=result.get('message_id'),
+                error_message=result.get('error'),
+                attempt_count=1,
+                last_attempt_at=timezone.now(),
+                delivered_at=timezone.now() if result['status'] in [
+                    'sent', 'delivered'] else None,
+                metadata=metadata
+            )
+
+            results.append({
+                'user_id': user.id,
+                'user_email': user.email,
+                'delivery_id': delivery_log.id,
+                'status': result['status'],
+                'channel': result['channel'],
+                'recipient': recipient,
+                'error': result.get('error')
+            })
+
+        # Get delivery statistics
+        delivery_stats = notification_service.get_delivery_stats()
+
+        return Response({
+            'message': f'Notification sending completed for alert: {alert.title}',
+            'alert_id': alert_id,
+            'total_recipients': len(target_users),
+            'delivery_results': results,
+            'delivery_stats': delivery_stats
+        }, status=status.HTTP_200_OK)
+
+
+class NotificationDeliveryStatusView(APIView):
+    """
+    API endpoint for checking notification delivery status (Admin only)
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, alert_id):
+        """
+        Get delivery status for all notifications of a specific alert
+        """
+        if not request.user.is_admin:
+            return Response(
+                {'error': 'Only administrators can view delivery status'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        try:
+            alert = Alert.objects.get(id=alert_id, is_active=True)
+        except Alert.DoesNotExist:
+            return Response(
+                {'error': 'Alert not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Get all delivery logs for this alert
+        delivery_logs = NotificationDelivery.objects.filter(
+            alert=alert).order_by('-created_at')
+
+        # Prepare response data
+        delivery_data = []
+        for log in delivery_logs:
+            delivery_data.append({
+                'id': log.id,
+                'user': {
+                    'id': log.user.id,
+                    'email': log.user.email,
+                    'full_name': log.user.full_name
+                },
+                'delivery_type': log.delivery_type,
+                'recipient': log.recipient,
+                'status': log.status,
+                'message_id': log.message_id,
+                'error_message': log.error_message,
+                'attempt_count': log.attempt_count,
+                'last_attempt_at': log.last_attempt_at,
+                'delivered_at': log.delivered_at,
+                'created_at': log.created_at
+            })
+
+        # Calculate delivery statistics
+        total_deliveries = delivery_logs.count()
+        if total_deliveries > 0:
+            sent_count = delivery_logs.filter(
+                status__in=['sent', 'delivered']).count()
+            failed_count = delivery_logs.filter(status='failed').count()
+            pending_count = delivery_logs.filter(status='pending').count()
+
+            delivery_summary = {
+                'total_deliveries': total_deliveries,
+                'sent_count': sent_count,
+                'failed_count': failed_count,
+                'pending_count': pending_count,
+                'success_rate': round((sent_count / total_deliveries) * 100, 2)
+            }
+        else:
+            delivery_summary = {
+                'total_deliveries': 0,
+                'sent_count': 0,
+                'failed_count': 0,
+                'pending_count': 0,
+                'success_rate': 0
+            }
+
+        return Response({
+            'alert_id': alert_id,
+            'alert_title': alert.title,
+            'delivery_summary': delivery_summary,
+            'delivery_logs': delivery_data
+        }, status=status.HTTP_200_OK)
+
+
+class RetryFailedNotificationsView(APIView):
+    """
+    API endpoint for retrying failed notifications (Admin only)
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, alert_id):
+        """
+        Retry failed notifications for a specific alert
+        """
+        if not request.user.is_admin:
+            return Response(
+                {'error': 'Only administrators can retry notifications'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        try:
+            alert = Alert.objects.get(id=alert_id, is_active=True)
+        except Alert.DoesNotExist:
+            return Response(
+                {'error': 'Alert not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Import notification service
+        from .notification_system import notification_service
+
+        # Get failed delivery logs
+        failed_deliveries = NotificationDelivery.objects.filter(
+            alert=alert,
+            status='failed'
+        )
+
+        if not failed_deliveries.exists():
+            return Response(
+                {'message': 'No failed deliveries found to retry'},
+                status=status.HTTP_200_OK
+            )
+
+        retry_results = []
+        for delivery_log in failed_deliveries:
+            # Retry the notification
+            metadata = delivery_log.metadata or {}
+            metadata['retry_attempt'] = delivery_log.attempt_count + 1
+
+            result = notification_service.send_notification(
+                delivery_type=delivery_log.delivery_type,
+                recipient=delivery_log.recipient,
+                title=alert.title,
+                message=alert.message_body,
+                metadata=metadata
+            )
+
+            # Update delivery log
+            delivery_log.status = result['status']
+            delivery_log.attempt_count += 1
+            delivery_log.last_attempt_at = timezone.now()
+            if result['status'] in ['sent', 'delivered']:
+                delivery_log.delivered_at = timezone.now()
+                delivery_log.error_message = None
+            else:
+                delivery_log.error_message = result.get('error')
+
+            if result.get('message_id'):
+                delivery_log.message_id = result['message_id']
+
+            delivery_log.save()
+
+            retry_results.append({
+                'delivery_id': delivery_log.id,
+                'user_email': delivery_log.user.email,
+                'status': result['status'],
+                'attempt_count': delivery_log.attempt_count,
+                'error': result.get('error')
+            })
+
+        return Response({
+            'message': f'Retry completed for {len(failed_deliveries)} failed notifications',
+            'alert_id': alert_id,
+            'retry_results': retry_results
+        }, status=status.HTTP_200_OK)
+
+
+# Scheduler Management Views
+
+class SchedulerStatusView(APIView):
+    """
+    API endpoint for checking scheduler status (Admin only)
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        """
+        Get current status of the task scheduler
+        """
+        if not request.user.is_admin:
+            return Response(
+                {'error': 'Only administrators can view scheduler status'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        from .scheduler import scheduler
+
+        status_data = scheduler.get_status()
+
+        return Response({
+            'scheduler_status': status_data,
+            'cron_setup_guide': scheduler.get_cron_setup_guide()
+        }, status=status.HTTP_200_OK)
+
+
+class SchedulerControlView(APIView):
+    """
+    API endpoint for controlling the scheduler (Admin only)
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        """
+        Start or stop the scheduler
+        """
+        if not request.user.is_admin:
+            return Response(
+                {'error': 'Only administrators can control the scheduler'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        action = request.data.get('action')
+
+        if action not in ['start', 'stop']:
+            return Response(
+                {'error': 'Invalid action. Use "start" or "stop"'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        from .scheduler import scheduler
+
+        if action == 'start':
+            scheduler.start()
+            message = 'Scheduler started successfully'
+        else:
+            scheduler.stop()
+            message = 'Scheduler stopped successfully'
+
+        return Response({
+            'message': message,
+            'action': action,
+            'scheduler_running': scheduler.running
+        }, status=status.HTTP_200_OK)
+
+
+class RunTaskView(APIView):
+    """
+    API endpoint for running scheduled tasks manually (Admin only)
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        """
+        Run a specific task immediately
+        """
+        if not request.user.is_admin:
+            return Response(
+                {'error': 'Only administrators can run tasks'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        task_name = request.data.get('task_name')
+
+        if not task_name:
+            return Response(
+                {'error': 'task_name is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        from .scheduler import scheduler
+
+        if task_name not in scheduler.tasks:
+            available_tasks = list(scheduler.tasks.keys())
+            return Response(
+                {
+                    'error': f'Task "{task_name}" not found',
+                    'available_tasks': available_tasks
+                },
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        result = scheduler.run_task_now(task_name)
+
+        if result:
+            return Response({
+                'message': f'Task "{task_name}" executed',
+                'task_result': {
+                    'success': result.success,
+                    'message': result.message,
+                    'duration': result.duration,
+                    'timestamp': result.timestamp.isoformat()
+                }
+            }, status=status.HTTP_200_OK)
+        else:
+            return Response(
+                {'error': f'Failed to execute task "{task_name}"'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )

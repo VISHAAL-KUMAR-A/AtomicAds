@@ -242,3 +242,47 @@ class AlertStatus(models.Model):
     class Meta:
         unique_together = ['alert', 'user']
         ordering = ['-created_at']
+
+
+class NotificationDelivery(models.Model):
+    """
+    Model to track notification delivery status and details
+    """
+    DELIVERY_STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('sent', 'Sent'),
+        ('delivered', 'Delivered'),
+        ('failed', 'Failed'),
+        ('retry', 'Retry'),
+    ]
+
+    alert = models.ForeignKey(
+        Alert, on_delete=models.CASCADE, related_name='delivery_logs')
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='notification_deliveries')
+
+    delivery_type = models.CharField(
+        max_length=10, choices=Alert.DELIVERY_TYPE_CHOICES)
+    recipient = models.CharField(
+        max_length=255, help_text="Email, phone number, or user ID")
+
+    status = models.CharField(
+        max_length=10, choices=DELIVERY_STATUS_CHOICES, default='pending')
+    message_id = models.CharField(max_length=255, blank=True, null=True)
+    error_message = models.TextField(blank=True, null=True)
+
+    attempt_count = models.IntegerField(default=0)
+    last_attempt_at = models.DateTimeField(null=True, blank=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+
+    metadata = models.JSONField(default=dict, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.alert.title} -> {self.user.email} ({self.delivery_type}): {self.status}"
+
+    class Meta:
+        ordering = ['-created_at']
+        unique_together = ['alert', 'user', 'delivery_type']

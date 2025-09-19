@@ -9,10 +9,53 @@ class TeamSerializer(serializers.ModelSerializer):
     """
     Serializer for Team model
     """
+    member_count = serializers.SerializerMethodField()
+
     class Meta:
         model = Team
-        fields = ['id', 'name', 'description', 'created_at']
-        read_only_fields = ['id', 'created_at']
+        fields = ['id', 'name', 'description',
+                  'member_count', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def get_member_count(self, obj):
+        return obj.members.count()
+
+
+class TeamDetailSerializer(TeamSerializer):
+    """
+    Detailed serializer for Team model with member information
+    """
+    members = serializers.SerializerMethodField()
+
+    class Meta(TeamSerializer.Meta):
+        fields = TeamSerializer.Meta.fields + ['members']
+
+    def get_members(self, obj):
+        return [
+            {
+                'id': member.id,
+                'email': member.email,
+                'full_name': member.full_name,
+                'role': member.role,
+                'is_active': member.is_active
+            }
+            for member in obj.members.all()
+        ]
+
+
+class TeamMemberAssignmentSerializer(serializers.Serializer):
+    """
+    Serializer for assigning/removing team members
+    """
+    user_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        help_text="List of user IDs to assign to this team"
+    )
+    action = serializers.ChoiceField(
+        choices=[('assign', 'Assign'), ('remove', 'Remove')],
+        default='assign',
+        help_text="Action to perform: assign users to team or remove them"
+    )
 
 
 class UserRegistrationSerializer(serializers.ModelSerializer):
